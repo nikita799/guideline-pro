@@ -16,7 +16,7 @@ assert os.getenv("OPENAI_API_KEY")
 
 WEAVIATE_URL = os.getenv("WEAVIATE_URL")
 WEAVIATE_API_KEY = os.getenv("WEAVIATE_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
 COLLECTION_NAME = "Guideline"
 
 
@@ -64,6 +64,28 @@ def retrieve_chunks(query: str, k: int = 5, alpha: float = 0.8) -> List[Citation
     return chunks
 
 
+def rewrite_query(client: OpenAI, query: str) -> str:
+    system_prompt = (
+        "Rewrite the clinician's question into a concise search query for "
+        "retrieving clinical guideline passages. Keep key clinical concepts, "
+        "include relevant synonyms or alternative terms, and remove any filler. "
+        "Return only the rewritten query."
+    )
+    try:
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": query},
+            ],
+            temperature=0.2,
+        )
+        rewritten = (response.choices[0].message.content or "").strip()
+        return rewritten if rewritten else query
+    except Exception:
+        return query
+
+
 def build_context(chunks: List[CitationChunk]) -> str:
     if not chunks:
         return ""
@@ -80,19 +102,20 @@ def format_citation_links(chunks: List[CitationChunk]) -> str:
     return links
 
 
-def get_assistant_response(client: OpenAI, query: str, chunks: List[CitationChunk], history: List[dict]) -> str:
+def build_messages(query: str, chunks: List[CitationChunk], history: List[dict]) -> list[dict]:
     context = build_context(chunks)
     if not context:
-        return (
-            "I couldn't find relevant guideline passages for that question. "
-            "Please try a more specific clinical query."
-        )
-
+        return []
     system_prompt = (
         "You are a clinical guideline assistant. Answer the clinician's question "
         "using only the provided guideline excerpts. Do not add knowledge beyond "
         "the excerpts. If the excerpts do not contain the answer, say you do not "
-        "have enough information. Provide concise, clinically relevant answers. "
+        "have enough information. Provide concise, clinically relevant answers "
+        "that are actionable for clinicians. When relevant and supported by the "
+        "excerpts, explicitly state treatment decisions (e.g., initiate or avoid "
+        "therapies, first-line vs second-line options). If treatment decisions "
+        "are not supported by the excerpts, say so. If the excerpts include "
+        "details like dosing, timing, contraindications, or monitoring, include them. "
         "Cite sources minimally in square brackets like [1]."
     )
     messages = [
@@ -104,14 +127,29 @@ def get_assistant_response(client: OpenAI, query: str, chunks: List[CitationChun
     ]
     messages.extend(history)
     messages.append({"role": "user", "content": query})
+    return messages
 
-    response = client.chat.completions.create(
+
+def stream_assistant_response(
+    client: OpenAI,
+    query: str,
+    chunks: List[CitationChunk],
+    history: List[dict],
+) -> tuple[bool, str | object]:
+    if not chunks:
+        return (
+            False,
+            "I couldn't find relevant guideline passages for that question. "
+            "Please try a more specific clinical query.",
+        )
+    messages = build_messages(query, chunks, history)
+    stream = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=messages,
         temperature=0.2,
+        stream=True,
     )
-    return response.choices[0].message.content
-
+    return True, stream
 
 def render_citations(chunks: List[CitationChunk]) -> None:
     if not chunks:
@@ -130,6 +168,7 @@ def main() -> None:
     st.set_page_config(page_title="Clinical Guideline Chat", page_icon="🩺")
     st.title("🩺 Clinical Guideline Chat")
     st.caption("Ask clinical questions and receive guideline-based answers with citations.")
+    st.caption("Click a citation like [1] to jump to the full excerpt.")
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -145,23 +184,47 @@ def main() -> None:
             st.markdown(query)
 
         client = OpenAI()
-        chunks = retrieve_chunks(query)
-        history = [
-            msg
-            for msg in st.session_state.messages
-            if msg["role"] in {"user", "assistant"}
-        ]
-        response = get_assistant_response(client, query, chunks, history)
+        with st.status("Working on your request…", expanded=True) as status:
+            status.write("Rewriting query for guideline retrieval…")
+            retrieval_query = rewrite_query(client, query)
+            if retrieval_query != query:
+                status.write(f"Using rewritten search query: {retrieval_query}")
+            status.write("Running hybrid RAG search against guideline excerpts…")
+            chunks = retrieve_chunks(retrieval_query)
+            status.write("Building clinical context from retrieved excerpts…")
+            history = [
+                msg
+                for msg in st.session_state.messages
+                if msg["role"] in {"user", "assistant"}
+            ]
+            status.write("Generating guideline-based response…")
+            is_stream, result = stream_assistant_response(client, query, chunks, history)
+            status.update(label="Response ready", state="complete")
+
+        response = ""
         citation_links = format_citation_links(chunks)
-        assistant_content = response
-        if citation_links:
-            assistant_content = f"{response}\n\n{citation_links}"
+        with st.chat_message("assistant"):
+            if not is_stream:
+                response = result
+                assistant_content = response
+                if citation_links:
+                    assistant_content = f"{response}\n\n{citation_links}"
+                st.markdown(assistant_content, unsafe_allow_html=True)
+            else:
+                placeholder = st.empty()
+                for event in result:
+                    delta = event.choices[0].delta.content
+                    if delta:
+                        response += delta
+                        placeholder.markdown(response, unsafe_allow_html=True)
+                assistant_content = response
+                if citation_links:
+                    assistant_content = f"{response}\n\n{citation_links}"
+                placeholder.markdown(assistant_content, unsafe_allow_html=True)
 
         st.session_state.messages.append(
             {"role": "assistant", "content": assistant_content}
         )
-        with st.chat_message("assistant"):
-            st.markdown(assistant_content, unsafe_allow_html=True)
         render_citations(chunks)
 
 
