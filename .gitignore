@@ -1,0 +1,11 @@
+# Secrets
+.env
+
+# Data
+data/
+
+# --- Python & Virtual Environments ---
+venv/
+
+# --- Jupyter Notebooks ---
+.ipynb_checkpoints/
