@@ -7,5 +7,11 @@ data/
 # --- Python & Virtual Environments ---
 venv/
 
+# --- Node & Next.js ---
+node_modules/
+.next/
+out/
+.turbo/
+
 # --- Jupyter Notebooks ---
 .ipynb_checkpoints/

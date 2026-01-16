@@ -1,0 +1,346 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap");
+
+:root {
+  color-scheme: dark;
+  --font-sans: "Inter", "SF Pro Text", "Helvetica Neue", Helvetica, Arial,
+    sans-serif;
+  --bg-1: #0b1623;
+  --bg-2: #0f2236;
+  --ink: #f9fafb;
+  --muted: #c4cbd4;
+  --surface: #142435;
+  --surface-alt: #182b40;
+  --accent: #4caf50;
+  --accent-strong: #3e8e41;
+  --border: #1f3347;
+  --shadow: 0 8px 24px rgba(5, 12, 20, 0.4);
+  --radius: 10px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: var(--font-sans);
+  color: var(--ink);
+  background: var(--bg-1);
+}
+
+.app-shell {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: var(--space-6) var(--space-5) 140px;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-5);
+  padding-bottom: var(--space-5);
+  border-bottom: 1px solid var(--border);
+  margin-bottom: var(--space-5);
+}
+
+.topbar-brand {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.topbar-title {
+  font-size: clamp(1.6rem, 2.6vw, 2.2rem);
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+
+.topbar-subtitle {
+  margin: 0;
+  color: var(--muted);
+  font-size: 1rem;
+  line-height: 1.5;
+}
+
+.btn {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 0.2s ease, background-color 0.2s ease,
+    color 0.2s ease;
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.btn-primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #f7f6f2;
+}
+
+.btn:hover {
+  border-color: var(--accent-strong);
+}
+
+.status-box {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-4) var(--space-5);
+  margin: var(--space-3) 0 var(--space-5);
+  box-shadow: none;
+}
+
+.status-title {
+  font-weight: 600;
+  font-size: 1rem;
+  margin-bottom: var(--space-2);
+  color: var(--ink);
+}
+
+.status-steps {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: var(--space-2);
+}
+
+.status-step {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  color: var(--muted);
+}
+
+.status-step.done {
+  color: var(--ink);
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #425468;
+}
+
+.status-step.done .status-dot {
+  background: var(--accent);
+}
+
+.chat {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.message {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.message.user .message-bubble {
+  background: #1c3246;
+  color: var(--ink);
+  margin-left: auto;
+}
+
+.message.assistant .message-bubble {
+  background: var(--surface);
+  color: var(--ink);
+  border: 1px solid var(--border);
+  box-shadow: none;
+}
+
+.message-bubble {
+  border-radius: var(--radius);
+  padding: var(--space-4) var(--space-5);
+  max-width: 680px;
+  line-height: 1.6;
+  font-size: 1.02rem;
+}
+
+.message-bubble a {
+  color: var(--accent);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.message-bubble a:hover {
+  text-decoration: underline;
+}
+
+.citations {
+  margin-top: 8px;
+}
+
+.citations h3 {
+  font-size: 0.9rem;
+  color: var(--muted);
+  margin: 0 0 10px;
+}
+
+.citation-card {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  padding: var(--space-4) var(--space-5);
+  margin: 10px 0;
+  background: var(--surface);
+  box-shadow: none;
+}
+
+.citation-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  text-decoration: none;
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.citation-index {
+  background: #253a4f;
+  color: var(--accent);
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.9rem;
+}
+
+.citation-body {
+  display: none;
+  margin-top: 10px;
+  color: var(--ink);
+  line-height: 1.55;
+}
+
+.citation-card:target .citation-body {
+  display: block;
+}
+
+.citation-body table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 12px 0;
+  font-size: 0.92rem;
+}
+
+.citation-body th,
+.citation-body td {
+  border: 1px solid var(--border);
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.citation-body thead th {
+  background: #1b2a3b;
+  color: var(--ink);
+}
+
+.chip-list {
+  display: grid;
+  gap: 10px;
+}
+
+.chip {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface);
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.2s ease;
+}
+
+.chip:hover {
+  border-color: var(--accent);
+}
+
+.input-shell {
+  position: fixed;
+  left: 50%;
+  width: min(820px, 92vw);
+  transform: translate(-50%, -50%);
+  transition: top 0.2s ease;
+  z-index: 10;
+}
+
+.app-shell[data-has-messages="false"] .input-shell {
+  top: 44vh;
+}
+
+.app-shell[data-has-messages="true"] .input-shell {
+  top: calc(100vh - 4.2rem);
+}
+
+.input-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-3) var(--space-4);
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  box-shadow: none;
+}
+
+.input-panel textarea {
+  border: none;
+  flex: 1;
+  resize: none;
+  font-size: 1rem;
+  font-family: inherit;
+  background: transparent;
+  outline: none;
+  color: var(--ink);
+  max-height: 120px;
+}
+
+.input-panel button {
+  border: none;
+  background: var(--accent);
+  color: #f9fafb;
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.2s ease;
+}
+
+.input-panel button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+@media (max-width: 768px) {
+  .topbar {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .input-panel {
+    border-radius: var(--radius);
+    padding: var(--space-3) var(--space-4);
+  }
+
+  .input-panel button {
+    padding: 10px 14px;
+  }
+
+  .app-shell {
+    padding-bottom: 200px;
+  }
+}
