@@ -1,46 +1,74 @@
+from __future__ import annotations
+
 import html
+import json
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List
 
+import sys
+
+
+def ensure_pydantic_v1() -> None:
+    try:
+        import pydantic.v1 as pydantic_v1
+    except Exception:
+        return
+
+    sys.modules["pydantic"] = pydantic_v1
+
+
+ensure_pydantic_v1()
+
+import chromadb
+from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
 from dotenv import load_dotenv
-from langsmith import Client, traceable
-from langsmith.wrappers import wrap_openai
-from markdown_it import MarkdownIt
-from openai import OpenAI
+try:
+    from langsmith import Client, traceable
+    from langsmith.wrappers import wrap_openai
+except Exception:
+    Client = None
+
+    def traceable(*_args, **_kwargs):
+        def decorator(func):
+            return func
+
+        return decorator
+
+    def wrap_openai(client):
+        return client
+try:
+    from markdown_it import MarkdownIt
+except Exception:
+    MarkdownIt = None
+import openai
+try:
+    from openai import OpenAI as OpenAIClient
+except Exception:  # pragma: no cover - depends on openai version
+    OpenAIClient = None
 import streamlit as st
-import weaviate
-from weaviate.auth import Auth
 
 load_dotenv()
 
-assert os.getenv("WEAVIATE_URL")
-assert os.getenv("WEAVIATE_API_KEY")
 assert os.getenv("OPENAI_API_KEY")
 
-WEAVIATE_URL = os.getenv("WEAVIATE_URL")
-WEAVIATE_API_KEY = os.getenv("WEAVIATE_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
 FOLLOWUP_MODEL = os.getenv("FOLLOWUP_MODEL", "gpt-5.2")
-COLLECTION_NAME = "Guideline"
+QUERY_EMBEDDING_MODEL = os.getenv("QUERY_EMBEDDING_MODEL", "text-embedding-3-large")
+CHROMA_PATH = os.getenv("CHROMA_PATH", "chroma_db")
+MAX_QUERY_VARIANTS = min(int(os.getenv("MAX_QUERY_VARIANTS", "4")), 4)
+MAX_RESULTS_PER_QUERY = min(int(os.getenv("MAX_RESULTS_PER_QUERY", "3")), 3)
 LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY") or os.getenv("LANGCHAIN_API_KEY")
 LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT", "clinical-guideline-chat")
 LANGSMITH_PROMPT = os.getenv("LANGSMITH_PROMPT", "")
 SESSION_MEMORY_TURNS = int(os.getenv("SESSION_MEMORY_TURNS", "6"))
 SESSION_MEMORY_MESSAGE_CHARS = int(os.getenv("SESSION_MEMORY_MESSAGE_CHARS", "400"))
 SESSION_MEMORY_CHARS = int(os.getenv("SESSION_MEMORY_CHARS", "1200"))
-FOLLOWUP_QUESTION_COUNT = min(int(os.getenv("FOLLOWUP_QUESTION_COUNT", "3")), 3)
-REWRITE_QUERY_WAIT_SECONDS = float(os.getenv("REWRITE_QUERY_WAIT_SECONDS", "0.2"))
-REWRITE_RETRIEVAL_TIMEOUT_SECONDS = float(
-    os.getenv("REWRITE_RETRIEVAL_TIMEOUT_SECONDS", "0.25")
-)
-SAMPLE_QUESTIONS = [
-    "Millal alustada metformiinravi 2. tüüpi diabeedi korral?",
-    "Millised on HbA1c eesmärgid 2. tüüpi diabeedi patsiendil?",
-    "Kuidas valida farmakoteraapia 2. tüüpi diabeedis?",
-]
+FOLLOWUP_QUESTION_COUNT = 0
+ENABLE_FOLLOWUPS = False
+SAMPLE_QUESTIONS: list[str] = []
 
 BASE_SYSTEM_PROMPT = (
     "You are a clinical guideline assistant. Answer the clinician's question "
@@ -56,9 +84,12 @@ BASE_SYSTEM_PROMPT = (
 )
 ESTONIAN_RESPONSE_PROMPT = "Vasta alati eesti keeles."
 
-MARKDOWN_RENDERER = MarkdownIt("commonmark", {"html": False, "linkify": True}).enable(
-    "table"
-)
+if MarkdownIt:
+    MARKDOWN_RENDERER = MarkdownIt("commonmark", {"html": False, "linkify": True}).enable(
+        "table"
+    )
+else:
+    MARKDOWN_RENDERER = None
 
 
 def _env_truthy(value: str | None) -> bool:
@@ -66,6 +97,8 @@ def _env_truthy(value: str | None) -> bool:
         return False
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
+
+DEBUG_RETRIEVAL_DEFAULT = _env_truthy(os.getenv("DEBUG_RETRIEVAL", "true"))
 
 if LANGSMITH_API_KEY:
     os.environ.setdefault("LANGSMITH_API_KEY", LANGSMITH_API_KEY)
@@ -75,7 +108,42 @@ if LANGSMITH_API_KEY:
 
 LANGSMITH_TRACING = os.getenv("LANGSMITH_TRACING") or os.getenv("LANGCHAIN_TRACING_V2")
 LANGSMITH_TRACING_ENABLED = bool(LANGSMITH_API_KEY) and _env_truthy(LANGSMITH_TRACING)
-LANGSMITH_CLIENT = Client(api_key=LANGSMITH_API_KEY) if LANGSMITH_API_KEY else None
+LANGSMITH_CLIENT = Client(api_key=LANGSMITH_API_KEY) if (Client and LANGSMITH_API_KEY) else None
+
+
+class OpenAIAdapter:
+    def __init__(self) -> None:
+        if OpenAIClient:
+            client = OpenAIClient()
+            if LANGSMITH_TRACING_ENABLED:
+                client = wrap_openai(client)
+            self._client = client
+            self._style = "client"
+        else:
+            openai.api_key = os.getenv("OPENAI_API_KEY")
+            self._client = openai
+            self._style = "module"
+
+    def chat_completions_create(self, **kwargs):
+        if self._style == "client":
+            return self._client.chat.completions.create(**kwargs)
+        return self._client.ChatCompletion.create(**kwargs)
+
+    def extract_message_content(self, response) -> str:
+        try:
+            if self._style == "client":
+                return (response.choices[0].message.content or "").strip()
+            return (response["choices"][0]["message"]["content"] or "").strip()
+        except Exception:
+            return ""
+
+    def extract_stream_delta(self, event) -> str | None:
+        try:
+            if self._style == "client":
+                return event.choices[0].delta.content
+            return event["choices"][0]["delta"].get("content")
+        except Exception:
+            return None
 
 
 def traceable_if_enabled(name: str):
@@ -87,11 +155,8 @@ def traceable_if_enabled(name: str):
     return decorator
 
 
-def get_openai_client() -> OpenAI:
-    client = OpenAI()
-    if LANGSMITH_TRACING_ENABLED:
-        return wrap_openai(client)
-    return client
+def get_openai_client() -> OpenAIAdapter:
+    return OpenAIAdapter()
 
 
 def truncate_text(text: str, max_chars: int) -> str:
@@ -155,22 +220,39 @@ def queue_query(text: str, dismiss_examples: bool = False) -> None:
 
 
 def inject_chat_styles(has_messages: bool, show_examples: bool) -> None:
-    chat_top = "42vh" if not has_messages else "calc(100vh - 3.8rem)"
     sample_spacer_height = "28vh" if show_examples else "0"
+    if has_messages:
+        position_css = "bottom: 1.25rem; top: auto; transform: translateX(-50%);"
+    else:
+        position_css = "top: 50%; bottom: auto; transform: translate(-50%, -50%);"
     st.markdown(
         f"""
         <style>
         :root {{
-          --chat-input-width: min(820px, 92vw);
+          --sidebar-offset: 0px;
+          --chat-input-width: min(820px, calc(92vw - var(--sidebar-offset)));
+        }}
+        :root:has(section[data-testid="stSidebar"][aria-expanded="true"]),
+        :root:has(section[data-testid="stSidebar"][data-state="expanded"]),
+        :root:has(section[data-testid="stSidebar"][aria-hidden="false"]) {{
+          --sidebar-offset: 21rem;
         }}
         div[data-testid="stChatInput"] {{
           position: fixed;
-          left: 50%;
+          left: calc(50% + (var(--sidebar-offset) / 2));
           width: var(--chat-input-width);
-          transform: translate(-50%, -50%);
-          top: {chat_top};
+          {position_css}
           z-index: 1000;
-          transition: top 0.6s ease;
+          transition: top 0.6s ease, bottom 0.6s ease, left 0.4s ease, width 0.4s ease;
+        }}
+        @media (max-width: 900px) {{
+          :root {{
+            --sidebar-offset: 0px;
+            --chat-input-width: min(92vw, 640px);
+          }}
+          div[data-testid="stChatInput"] {{
+            left: 50%;
+          }}
         }}
         section.main .block-container {{
           padding-bottom: 9rem;
@@ -187,10 +269,12 @@ def inject_chat_styles(has_messages: bool, show_examples: bool) -> None:
 @dataclass
 class CitationChunk:
     index: int
+    doc_id: str
     text: str
     source: str | None
     year: str | None
     breadcrumbs: str | None
+    distance: float | None = None
     display_index: int | None = None
 
     @property
@@ -288,7 +372,7 @@ def format_followup_preview(raw: str) -> str:
 
 @traceable_if_enabled("suggest_followup_questions")
 def suggest_followup_questions(
-    client: OpenAI,
+    client: OpenAIAdapter,
     query: str,
     answer: str,
     history: list[dict],
@@ -297,7 +381,7 @@ def suggest_followup_questions(
         return []
     system_prompt, user_content = build_followup_prompt(query, answer, history)
     try:
-        response = client.chat.completions.create(
+        response = client.chat_completions_create(
             model=FOLLOWUP_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -307,7 +391,7 @@ def suggest_followup_questions(
         )
     except Exception:
         return []
-    raw = (response.choices[0].message.content or "").strip()
+    raw = client.extract_message_content(response)
     if not raw:
         return []
     return parse_followup_questions(raw)
@@ -315,13 +399,13 @@ def suggest_followup_questions(
 
 @traceable_if_enabled("stream_followup_questions")
 def stream_followup_questions(
-    client: OpenAI, query: str, answer: str, history: list[dict]
+    client: OpenAIAdapter, query: str, answer: str, history: list[dict]
 ) -> object | None:
     if not answer.strip():
         return None
     system_prompt, user_content = build_followup_prompt(query, answer, history)
     try:
-        return client.chat.completions.create(
+        return client.chat_completions_create(
             model=FOLLOWUP_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -390,11 +474,13 @@ def _extract_prompt_text(prompt: object) -> str | None:
 def render_markdown(text: str) -> str:
     if not text:
         return ""
-    try:
-        return MARKDOWN_RENDERER.render(text)
-    except Exception:
-        escaped = html.escape(text).replace("\n", "<br/>")
-        return f"<p>{escaped}</p>"
+    if MARKDOWN_RENDERER:
+        try:
+            return MARKDOWN_RENDERER.render(text)
+        except Exception:
+            pass
+    escaped = html.escape(text).replace("\n", "<br/>")
+    return f"<p>{escaped}</p>"
 
 
 @traceable_if_enabled("load_system_prompt")
@@ -411,48 +497,126 @@ def load_system_prompt(langsmith_client: Client | None) -> tuple[str, str]:
     return BASE_SYSTEM_PROMPT, "langsmith-fallback"
 
 
-@traceable_if_enabled("retrieve_chunks")
-def retrieve_chunks(query: str, k: int = 5, alpha: float = 0.8) -> List[CitationChunk]:
-    with weaviate.connect_to_weaviate_cloud(
-        cluster_url=WEAVIATE_URL,
-        auth_credentials=Auth.api_key(WEAVIATE_API_KEY),
-    ) as client:
-        col = client.collections.use(COLLECTION_NAME)
-        props = ["text", "search_text", "breadcrumbs", "chunk_id", "source", "year"]
-        resp = col.query.hybrid(query=query, alpha=alpha, limit=k, return_properties=props)
+def resolve_chroma_path(path: str) -> str:
+    path_obj = Path(path)
+    if path_obj.is_absolute():
+        return str(path_obj)
+    return str((Path(__file__).resolve().parent / path_obj).resolve())
 
-    chunks: List[CitationChunk] = []
-    for idx, obj in enumerate(resp.objects, start=1):
-        props = obj.properties or {}
-        chunks.append(
-            CitationChunk(
-                index=idx,
-                text=props.get("text") or props.get("search_text") or "",
-                source=props.get("source"),
-                year=props.get("year"),
-                breadcrumbs=props.get("breadcrumbs"),
+
+def create_chroma_client(path: str):
+    os.environ.setdefault("ANONYMIZED_TELEMETRY", "false")
+    if hasattr(chromadb, "PersistentClient"):
+        return chromadb.PersistentClient(path=path)
+
+    try:
+        from chromadb.config import Settings
+    except Exception as exc:
+        raise SystemExit("Failed to import chromadb Settings.") from exc
+
+    settings = Settings(
+        chroma_db_impl="duckdb+parquet",
+        persist_directory=path,
+        anonymized_telemetry=False,
+    )
+    return chromadb.Client(settings)
+
+
+@st.cache_resource(show_spinner=False)
+def get_chroma_resources(chroma_path: str, embedding_model: str):
+    resolved_path = resolve_chroma_path(chroma_path)
+    client = create_chroma_client(resolved_path)
+    embedding_fn = OpenAIEmbeddingFunction(
+        api_key=os.getenv("OPENAI_API_KEY"), model_name=embedding_model
+    )
+    collection_names: list[str] = []
+    if hasattr(client, "_db") and hasattr(client._db, "list_collections"):
+        try:
+            raw_rows = client._db.list_collections()
+        except Exception:
+            raw_rows = []
+        for row in raw_rows:
+            if isinstance(row, (list, tuple)) and len(row) > 1:
+                collection_names.append(str(row[1]))
+    else:
+        try:
+            raw_collections = client.list_collections()
+        except Exception:
+            raw_collections = []
+
+        for item in raw_collections:
+            if isinstance(item, str):
+                name = item
+            elif isinstance(item, dict):
+                name = item.get("name")
+            else:
+                name = getattr(item, "name", None)
+            if name:
+                collection_names.append(str(name))
+
+    collections = []
+    for name in collection_names:
+        try:
+            collections.append(
+                client.get_collection(name=name, embedding_function=embedding_fn)
             )
-        )
-    return chunks
+        except Exception:
+            try:
+                collections.append(
+                    client.get_or_create_collection(
+                        name=name, embedding_function=embedding_fn
+                    )
+                )
+            except Exception:
+                continue
+
+    return client, embedding_fn, collections
 
 
-@traceable_if_enabled("rewrite_query")
-def rewrite_query(client: OpenAI, query: str, history: list[dict]) -> str:
+def _parse_query_candidates(raw: str) -> list[str]:
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return [str(item).strip() for item in data if str(item).strip()]
+    except Exception:
+        pass
+
+    lines: list[str] = []
+    for line in raw.splitlines():
+        cleaned = line.strip()
+        if not cleaned:
+            continue
+        cleaned = re.sub(r"^\s*[\-\*\u2022]\s*", "", cleaned)
+        cleaned = re.sub(r"^\s*\d+[\).\s]+\s*", "", cleaned)
+        cleaned = cleaned.strip()
+        if cleaned:
+            lines.append(cleaned)
+    return lines
+
+
+@traceable_if_enabled("generate_search_queries")
+def generate_search_queries(
+    client: OpenAIAdapter, query: str, history: list[dict]
+) -> list[str]:
+    if MAX_QUERY_VARIANTS <= 1:
+        return [query]
+
     memory = build_memory_snippet(history)
     system_prompt = (
-        "Rewrite the clinician's question into a concise search query for "
-        "retrieving clinical guideline passages. Keep key clinical concepts, "
-        "include relevant synonyms or alternative terms, and remove any filler. "
-        "If the question is a follow-up, use the conversation context to resolve "
-        "references. "
-        "Return only the rewritten query."
+        "You generate search queries for retrieving relevant clinical guideline "
+        "passages. Produce up to 4 concise queries that cover key terms, synonyms, "
+        "and related phrasing. Return only a JSON array of strings."
     )
     if memory:
-        user_content = f"Conversation context:\n{memory}\n\nCurrent question:\n{query}"
+        user_content = f"Conversation context:\n{memory}\n\nQuestion:\n{query}"
     else:
         user_content = query
+
     try:
-        response = client.chat.completions.create(
+        response = client.chat_completions_create(
             model=OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -460,44 +624,194 @@ def rewrite_query(client: OpenAI, query: str, history: list[dict]) -> str:
             ],
             temperature=0.2,
         )
-        rewritten = (response.choices[0].message.content or "").strip()
-        return rewritten if rewritten else query
     except Exception:
-        return query
+        return [query]
+
+    raw = client.extract_message_content(response)
+    candidates = _parse_query_candidates(raw)
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for item in [query] + candidates:
+        cleaned = " ".join(item.split())
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(cleaned)
+        if len(ordered) >= MAX_QUERY_VARIANTS:
+            break
+
+    return ordered or [query]
 
 
-def retrieve_chunks_fast(
-    client: OpenAI, query: str, history: list[dict]
-) -> List[CitationChunk]:
-    rewritten_query: str | None = None
-    chunks: List[CitationChunk] = []
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        rewrite_future = executor.submit(rewrite_query, client, query, history)
-        retrieve_future = executor.submit(retrieve_chunks, query)
-        chunks = retrieve_future.result()
+@traceable_if_enabled("retrieve_chunks_for_query")
+def retrieve_chunks_for_query(
+    query: str,
+    collections: list,
+    embedding_fn: OpenAIEmbeddingFunction,
+    k: int = MAX_RESULTS_PER_QUERY,
+    debug: bool = False,
+) -> tuple[List[CitationChunk], dict]:
+    debug_info: dict = {"query": query, "collections": []}
+    try:
+        embedding = embedding_fn([query])[0]
+        if debug:
+            debug_info["embedding_dim"] = len(embedding)
+    except Exception as exc:
+        debug_info["error"] = str(exc)
+        return [], debug_info
+
+    candidates: list[CitationChunk] = []
+    for collection in collections:
+        collection_name = getattr(collection, "name", None)
+        entry: dict = {"collection": collection_name}
         try:
-            rewritten_query = rewrite_future.result(timeout=REWRITE_QUERY_WAIT_SECONDS)
-        except TimeoutError:
-            rewritten_query = None
-        except Exception:
-            rewritten_query = None
-        if rewritten_query:
-            rewritten_query = rewritten_query.strip()
-        if (
-            rewritten_query
-            and rewritten_query.lower() != query.strip().lower()
-            and REWRITE_RETRIEVAL_TIMEOUT_SECONDS > 0
-        ):
-            alt_future = executor.submit(retrieve_chunks, rewritten_query)
-            try:
-                alt_chunks = alt_future.result(timeout=REWRITE_RETRIEVAL_TIMEOUT_SECONDS)
-            except TimeoutError:
-                alt_chunks = []
-            except Exception:
-                alt_chunks = []
-            if alt_chunks:
-                return alt_chunks
-    return chunks
+            resp = collection.query(
+                query_embeddings=[embedding],
+                n_results=k,
+                include=["metadatas", "documents", "distances"],
+            )
+        except Exception as exc:
+            entry["error"] = str(exc)
+            if debug:
+                debug_info["collections"].append(entry)
+            continue
+
+        ids = (resp.get("ids") or [[]])[0] or []
+        documents = (resp.get("documents") or [[]])[0] or []
+        metadatas = (resp.get("metadatas") or [[]])[0] or []
+        distances = (resp.get("distances") or [[]])[0] or []
+        if debug:
+            entry["ids"] = ids
+            entry["distances"] = distances
+            entry["documents"] = documents
+            entry["metadatas"] = metadatas
+            debug_info["collections"].append(entry)
+
+        for idx, doc_id in enumerate(ids):
+            meta = metadatas[idx] if idx < len(metadatas) else {}
+            text = ""
+            if idx < len(documents):
+                text = documents[idx] or ""
+            if not text:
+                text = meta.get("text") or meta.get("search_text") or ""
+            if not text:
+                continue
+
+            distance = distances[idx] if idx < len(distances) else None
+            source = (
+                meta.get("source")
+                or meta.get("guideline")
+                or meta.get("class")
+                or meta.get("collection")
+                or collection_name
+            )
+            year = meta.get("year")
+            year_str = str(year) if year is not None else None
+            breadcrumbs = meta.get("breadcrumbs")
+
+            candidates.append(
+                CitationChunk(
+                    index=0,
+                    doc_id=str(doc_id),
+                    text=text,
+                    source=source,
+                    year=year_str,
+                    breadcrumbs=breadcrumbs,
+                    distance=distance,
+                )
+            )
+
+    dedup: dict[str, CitationChunk] = {}
+    for cand in candidates:
+        existing = dedup.get(cand.doc_id)
+        if not existing:
+            dedup[cand.doc_id] = cand
+            continue
+        cand_dist = cand.distance if cand.distance is not None else float("inf")
+        existing_dist = (
+            existing.distance if existing.distance is not None else float("inf")
+        )
+        if cand_dist < existing_dist:
+            dedup[cand.doc_id] = cand
+
+    ordered = sorted(
+        dedup.values(),
+        key=lambda c: c.distance if c.distance is not None else float("inf"),
+    )
+    return ordered[:k], debug_info
+
+
+@traceable_if_enabled("retrieve_chunks_parallel")
+def retrieve_chunks_parallel(
+    queries: list[str],
+    debug: bool = False,
+) -> tuple[List[CitationChunk], dict | None]:
+    _client, embedding_fn, collections = get_chroma_resources(
+        CHROMA_PATH, QUERY_EMBEDDING_MODEL
+    )
+    if not collections:
+        payload = {
+            "chroma_path": resolve_chroma_path(CHROMA_PATH),
+            "collections": [],
+            "queries": queries,
+            "per_query": [],
+            "merged": [],
+            "error": "No collections found",
+        }
+        return [], payload if debug else None
+
+    results_by_index: dict[int, List[CitationChunk]] = {}
+    debug_by_index: dict[int, dict] = {}
+    for idx, query in enumerate(queries):
+        try:
+            chunk_list, debug_info = retrieve_chunks_for_query(
+                query,
+                collections,
+                embedding_fn,
+                MAX_RESULTS_PER_QUERY,
+                debug,
+            )
+        except Exception as exc:
+            chunk_list = []
+            debug_info = {"query": query, "error": str(exc), "collections": []}
+        results_by_index[idx] = chunk_list
+        debug_by_index[idx] = debug_info
+
+    combined: list[CitationChunk] = []
+    seen: set[str] = set()
+    for idx in range(len(queries)):
+        for chunk in results_by_index.get(idx, []):
+            if chunk.doc_id in seen:
+                continue
+            seen.add(chunk.doc_id)
+            combined.append(chunk)
+
+    for idx, chunk in enumerate(combined, start=1):
+        chunk.index = idx
+
+    payload = None
+    if debug:
+        payload = {
+            "chroma_path": resolve_chroma_path(CHROMA_PATH),
+            "collections": [getattr(c, "name", None) for c in collections],
+            "queries": queries,
+            "per_query": [debug_by_index.get(i) for i in range(len(queries))],
+            "merged": [
+                {
+                    "doc_id": chunk.doc_id,
+                    "distance": chunk.distance,
+                    "source": chunk.source,
+                    "breadcrumbs": chunk.breadcrumbs,
+                    "text": chunk.text,
+                }
+                for chunk in combined
+            ],
+        }
+
+    return combined, payload
 
 
 def build_context(chunks: List[CitationChunk]) -> str:
@@ -652,7 +966,7 @@ def build_messages(
 
 @traceable_if_enabled("stream_assistant_response")
 def stream_assistant_response(
-    client: OpenAI,
+    client: OpenAIAdapter,
     query: str,
     chunks: List[CitationChunk],
     history: List[dict],
@@ -665,7 +979,7 @@ def stream_assistant_response(
             "Palun esita täpsem kliiniline küsimus.",
         )
     messages = build_messages(query, chunks, history, system_prompt)
-    stream = client.chat.completions.create(
+    stream = client.chat_completions_create(
         model=OPENAI_MODEL,
         messages=messages,
         temperature=0.2,
@@ -807,6 +1121,7 @@ def main() -> None:
         if st.button("Uus vestlus", type="primary"):
             reset_chat_state()
             st.rerun()
+        debug_retrieval = st.checkbox("Debug retrieval", value=st.session_state.get("debug_retrieval", DEBUG_RETRIEVAL_DEFAULT), key="debug_retrieval")
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -823,7 +1138,7 @@ def main() -> None:
 
     has_messages = bool(st.session_state.messages)
     ui_has_messages = has_messages or bool(st.session_state.pending_query)
-    show_examples = (not ui_has_messages) and (not st.session_state.examples_dismissed)
+    show_examples = (not ui_has_messages) and (not st.session_state.examples_dismissed) and bool(SAMPLE_QUESTIONS)
     inject_chat_styles(ui_has_messages, show_examples=show_examples)
 
     assistant_counter = 0
@@ -844,13 +1159,7 @@ def main() -> None:
                 st.markdown(content, unsafe_allow_html=True)
             if citations:
                 render_citations(citations, scope)
-            followups = message.get("followups") or []
-            if followups:
-                render_question_chips(
-                    followups,
-                    key_prefix=f"followup-{render_token}-{group}",
-                    label="Jätkuküsimused",
-                )
+            followups = []
         else:
             with st.chat_message(role):
                 st.markdown(message["content"])
@@ -884,16 +1193,25 @@ def main() -> None:
         client = get_openai_client()
         status_container = st.empty()
         with status_container.status("Loon vastust", expanded=True) as status:
-            status.write("(1) Teen andmebaasi päringut")
+            status.write("(1) Koostan otsingupäringud")
             history = build_history(st.session_state.messages, query)
-            chunks = retrieve_chunks_fast(client, query, history)
-            status.write("(2) Loen vastuseid")
-            system_prompt, _prompt_source = load_system_prompt(LANGSMITH_CLIENT)
+            search_queries = generate_search_queries(client, query, history)
+            status.write("(2) Teen andmebaasi päringut")
+            chunks, debug_payload = retrieve_chunks_parallel(search_queries, debug_retrieval)
             status.write("(3) Loon vastust")
+            system_prompt, _prompt_source = load_system_prompt(LANGSMITH_CLIENT)
             is_stream, result = stream_assistant_response(
                 client, query, chunks, history, system_prompt
             )
             status.update(state="complete")
+
+        if debug_retrieval and debug_payload is not None:
+            with st.expander("Debug: Chroma retrieval", expanded=True):
+                st.markdown("**Queries sent to ChromaDB:**")
+                for query_item in search_queries:
+                    st.code(query_item)
+                st.markdown("**ChromaDB results:**")
+                st.json(debug_payload)
 
         response = ""
         used_chunks: List[CitationChunk] = []
@@ -923,7 +1241,7 @@ def main() -> None:
         else:
             previous_order: list[int] = []
             for event in result:
-                delta = event.choices[0].delta.content
+                delta = client.extract_stream_delta(event)
                 if delta:
                     response += delta
                     answer_placeholder.markdown(response, unsafe_allow_html=True)
@@ -944,36 +1262,6 @@ def main() -> None:
             else:
                 assistant_content = assistant_text
             answer_placeholder.markdown(assistant_content, unsafe_allow_html=True)
-
-        if assistant_text:
-            followup_container = st.empty()
-            followup_stream = stream_followup_questions(
-                client, query, assistant_text, history
-            )
-            followup_raw = ""
-            if followup_stream:
-                followup_block = followup_container.container()
-                followup_block.caption("Jätkuküsimused")
-                preview_slot = followup_block.empty()
-                preview_slot.markdown("_Koostan jätkuküsimusi..._")
-                for event in followup_stream:
-                    delta = event.choices[0].delta.content
-                    if delta:
-                        followup_raw += delta
-                        preview_slot.markdown(format_followup_preview(followup_raw))
-                followups = parse_followup_questions(followup_raw)
-            else:
-                followups = suggest_followup_questions(client, query, assistant_text, history)
-            if followups:
-                followup_container.empty()
-                render_question_chips(
-                    followups,
-                    key_prefix=f"followup-{render_token}-{citation_group}",
-                    label="Jätkuküsimused",
-                    container=followup_container.container(),
-                )
-            else:
-                followup_container.empty()
 
         st.session_state.citation_group_counter = citation_group
         st.session_state.messages.append(
