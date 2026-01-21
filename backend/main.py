@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from typing import Iterable, Literal
 
 from dotenv import load_dotenv
+
+load_dotenv()
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -15,8 +18,6 @@ from openai import OpenAI
 from pydantic import BaseModel
 import weaviate
 from weaviate.auth import Auth
-
-load_dotenv()
 
 assert os.getenv("WEAVIATE_URL")
 assert os.getenv("WEAVIATE_API_KEY")

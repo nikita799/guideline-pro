@@ -4,11 +4,44 @@ import html
 import json
 import os
 import re
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
+from uuid import uuid4
 
 import sys
+
+from dotenv import load_dotenv
+
+load_dotenv()
+LANGSMITH_DEBUG = os.getenv("LANGSMITH_DEBUG", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+def _log_langsmith(message: str) -> None:
+    if LANGSMITH_DEBUG:
+        print(f"[langsmith] {message}", file=sys.stderr)
+
+try:
+    from langsmith import Client, traceable
+    from langsmith.wrappers import wrap_openai
+except Exception as exc:
+    _log_langsmith(f"import failed: {exc}")
+    Client = None
+
+    def traceable(*_args, **_kwargs):
+        def decorator(func):
+            return func
+
+        return decorator
+
+    def wrap_openai(client):
+        return client
 
 
 def ensure_pydantic_v1() -> None:
@@ -24,21 +57,7 @@ ensure_pydantic_v1()
 
 import chromadb
 from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
-from dotenv import load_dotenv
-try:
-    from langsmith import Client, traceable
-    from langsmith.wrappers import wrap_openai
-except Exception:
-    Client = None
 
-    def traceable(*_args, **_kwargs):
-        def decorator(func):
-            return func
-
-        return decorator
-
-    def wrap_openai(client):
-        return client
 try:
     from markdown_it import MarkdownIt
 except Exception:
@@ -49,8 +68,6 @@ try:
 except Exception:  # pragma: no cover - depends on openai version
     OpenAIClient = None
 import streamlit as st
-
-load_dotenv()
 
 assert os.getenv("OPENAI_API_KEY")
 
@@ -63,6 +80,7 @@ MAX_RESULTS_PER_QUERY = min(int(os.getenv("MAX_RESULTS_PER_QUERY", "3")), 3)
 LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY") or os.getenv("LANGCHAIN_API_KEY")
 LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT", "clinical-guideline-chat")
 LANGSMITH_PROMPT = os.getenv("LANGSMITH_PROMPT", "")
+LANGSMITH_MAX_CHUNK_CHARS = int(os.getenv("LANGSMITH_MAX_CHUNK_CHARS", "800"))
 SESSION_MEMORY_TURNS = int(os.getenv("SESSION_MEMORY_TURNS", "6"))
 SESSION_MEMORY_MESSAGE_CHARS = int(os.getenv("SESSION_MEMORY_MESSAGE_CHARS", "400"))
 SESSION_MEMORY_CHARS = int(os.getenv("SESSION_MEMORY_CHARS", "1200"))
@@ -98,8 +116,6 @@ def _env_truthy(value: str | None) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-DEBUG_RETRIEVAL_DEFAULT = _env_truthy(os.getenv("DEBUG_RETRIEVAL", "true"))
-
 if LANGSMITH_API_KEY:
     os.environ.setdefault("LANGSMITH_API_KEY", LANGSMITH_API_KEY)
     os.environ.setdefault("LANGSMITH_PROJECT", LANGSMITH_PROJECT)
@@ -109,6 +125,16 @@ if LANGSMITH_API_KEY:
 LANGSMITH_TRACING = os.getenv("LANGSMITH_TRACING") or os.getenv("LANGCHAIN_TRACING_V2")
 LANGSMITH_TRACING_ENABLED = bool(LANGSMITH_API_KEY) and _env_truthy(LANGSMITH_TRACING)
 LANGSMITH_CLIENT = Client(api_key=LANGSMITH_API_KEY) if (Client and LANGSMITH_API_KEY) else None
+
+if LANGSMITH_DEBUG:
+    endpoint = (
+        os.getenv("LANGSMITH_ENDPOINT")
+        or os.getenv("LANGCHAIN_ENDPOINT")
+        or "https://api.smith.langchain.com"
+    )
+    _log_langsmith(
+        f"tracing_enabled={LANGSMITH_TRACING_ENABLED} project={LANGSMITH_PROJECT} endpoint={endpoint}"
+    )
 
 
 class OpenAIAdapter:
@@ -163,6 +189,113 @@ def truncate_text(text: str, max_chars: int) -> str:
     if max_chars <= 0 or len(text) <= max_chars:
         return text
     return text[:max_chars].rstrip() + "..."
+
+
+def _langsmith_enabled() -> bool:
+    return LANGSMITH_TRACING_ENABLED and LANGSMITH_CLIENT is not None
+
+
+def _langsmith_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _serialize_history_for_langsmith(history: list[dict]) -> list[dict]:
+    items: list[dict] = []
+    for message in history:
+        role = message.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        content = truncate_text(message.get("content", ""), SESSION_MEMORY_MESSAGE_CHARS)
+        if content:
+            items.append({"role": role, "content": content})
+    return items
+
+
+def _serialize_chunks_for_langsmith(chunks: List["CitationChunk"]) -> list[dict]:
+    serialized: list[dict] = []
+    for chunk in chunks:
+        serialized.append(
+            {
+                "doc_id": chunk.doc_id,
+                "source": chunk.source,
+                "breadcrumbs": chunk.breadcrumbs,
+                "distance": chunk.distance,
+                "text": truncate_text(chunk.text, LANGSMITH_MAX_CHUNK_CHARS),
+            }
+        )
+    return serialized
+
+
+def _serialize_citations_for_langsmith(chunks: List["CitationChunk"]) -> list[dict]:
+    serialized: list[dict] = []
+    for chunk in chunks:
+        serialized.append(
+            {
+                "doc_id": chunk.doc_id,
+                "index": chunk.index,
+                "display_index": chunk.display_index,
+                "label": chunk.label,
+            }
+        )
+    return serialized
+
+
+def _start_langsmith_run(query: str, history: list[dict]) -> object | None:
+    if not _langsmith_enabled():
+        _log_langsmith("skip create_run (disabled or no client)")
+        return None
+    run_id = uuid4()
+    inputs = {
+        "query": query,
+        "history": _serialize_history_for_langsmith(history),
+    }
+    extra = {
+        "metadata": {
+            "generation_model": OPENAI_MODEL,
+            "embedding_model": QUERY_EMBEDDING_MODEL,
+        }
+    }
+    try:
+        LANGSMITH_CLIENT.create_run(
+            id=run_id,
+            name="chat_turn",
+            run_type="chain",
+            inputs=inputs,
+            project_name=LANGSMITH_PROJECT,
+            start_time=_langsmith_now(),
+            extra=extra,
+        )
+    except Exception as exc:
+        _log_langsmith(f"create_run failed: {exc}")
+        return None
+    return run_id
+
+
+def _finish_langsmith_run(
+    run_id: object | None,
+    *,
+    search_queries: list[str],
+    chunks: List["CitationChunk"],
+    response: str,
+    citations: List["CitationChunk"],
+) -> None:
+    if not run_id or not _langsmith_enabled():
+        return
+    outputs = {
+        "search_queries": search_queries,
+        "retrieved_chunks": _serialize_chunks_for_langsmith(chunks),
+        "response": response,
+        "citations": _serialize_citations_for_langsmith(citations),
+    }
+    try:
+        LANGSMITH_CLIENT.update_run(
+            run_id,
+            outputs=outputs,
+            end_time=_langsmith_now(),
+        )
+    except Exception as exc:
+        _log_langsmith(f"update_run failed: {exc}")
+        return
 
 
 def build_history(messages: list[dict], current_query: str) -> list[dict]:
@@ -1121,7 +1254,6 @@ def main() -> None:
         if st.button("Uus vestlus", type="primary"):
             reset_chat_state()
             st.rerun()
-        debug_retrieval = st.checkbox("Debug retrieval", value=st.session_state.get("debug_retrieval", DEBUG_RETRIEVAL_DEFAULT), key="debug_retrieval")
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -1191,27 +1323,21 @@ def main() -> None:
             st.markdown(query)
 
         client = get_openai_client()
+        langsmith_run_id = None
         status_container = st.empty()
         with status_container.status("Loon vastust", expanded=True) as status:
             status.write("(1) Koostan otsingupäringud")
             history = build_history(st.session_state.messages, query)
+            langsmith_run_id = _start_langsmith_run(query, history)
             search_queries = generate_search_queries(client, query, history)
             status.write("(2) Teen andmebaasi päringut")
-            chunks, debug_payload = retrieve_chunks_parallel(search_queries, debug_retrieval)
+            chunks, _ = retrieve_chunks_parallel(search_queries, debug=False)
             status.write("(3) Loon vastust")
             system_prompt, _prompt_source = load_system_prompt(LANGSMITH_CLIENT)
             is_stream, result = stream_assistant_response(
                 client, query, chunks, history, system_prompt
             )
             status.update(state="complete")
-
-        if debug_retrieval and debug_payload is not None:
-            with st.expander("Debug: Chroma retrieval", expanded=True):
-                st.markdown("**Queries sent to ChromaDB:**")
-                for query_item in search_queries:
-                    st.code(query_item)
-                st.markdown("**ChromaDB results:**")
-                st.json(debug_payload)
 
         response = ""
         used_chunks: List[CitationChunk] = []
@@ -1262,6 +1388,15 @@ def main() -> None:
             else:
                 assistant_content = assistant_text
             answer_placeholder.markdown(assistant_content, unsafe_allow_html=True)
+
+        final_response = assistant_text or response
+        _finish_langsmith_run(
+            langsmith_run_id,
+            search_queries=search_queries,
+            chunks=chunks,
+            response=final_response,
+            citations=used_chunks,
+        )
 
         st.session_state.citation_group_counter = citation_group
         st.session_state.messages.append(
