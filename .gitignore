@@ -3,9 +3,11 @@
 
 # Data
 data/
+chroma_db/
 
 # --- Python & Virtual Environments ---
 venv/
+venv312/
 
 # --- Node & Next.js ---
 node_modules/
